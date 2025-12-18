@@ -173,17 +173,6 @@ Python → MySQL (OLTP) → Views (Semantic Layer) → SQL Analytics → Power B
 
 ---
 
-## Business Assumptions
-
--
--
--
--
--
--
-
----
-
 ## **🔑 Security & Permissions**
 
 - Implements **least privilege access**  
