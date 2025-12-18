@@ -119,6 +119,20 @@ def fetch_customer_ids(cur: "mysql.connector.cursor.MySQLCursor") -> list[int]:
     # Exemplo: [(1,), (2,), (3,)] → [1, 2, 3]
 
 
+
+def fetch_customer_activation(cur: "mysql.connector.cursor.MySQLCursor") -> dict[int, datetime]:
+    """
+    Lê customer_id e created_at da tabela customers.
+    """
+    cur.execute("SELECT customer_id, created_at FROM customers ORDER BY customer_id ASC")
+    rows = cur.fetchall()  # [(cid, created_at), ...]
+    if not rows:
+        raise RuntimeError("Customers table is empty.")
+    # created_at já vem como datetime (timezone do servidor; estás a forçar '+00:00' no SET time_zone)
+    return {int(cid): dt for cid, dt in rows}
+
+
+
 def fetch_order_status_ids(cur: "mysql.connector.cursor.MySQLCursor") -> dict[str, int]:
     # Define a função fetch_order_status_ids, que recebe como argumento cur, um cursor do MySQL.
     
@@ -266,6 +280,7 @@ def plan_orders_for_customers(
         plan = quotas_to_orders(quotas)
 
         if min_total_orders is None or len(plan) >= min_total_orders:
+            rng.shuffle(plan)
             if attempt > 1:
                 print(f"[info] mínimo atingido na tentativa {attempt}: total={len(plan)}")
             return plan
@@ -281,23 +296,38 @@ def generate_order_rows(
     end_excl: datetime,
     delivered_weight: int,
     cancelled_weight: int,
+    *,
+    activation_map: Mapping[int, datetime],
 ) -> list[OrderRow]:
     """
-    A partir do plano de encomendas (lista de customer_ids), gera linhas OrderRow
-    com datas cronológicas e estados finais 'delivered'/'cancelled'.
+    Para cada customer_id no plano, gera um order_date ∈ [max(start, activation[cid]), end_excl),
+    ordena cronologicamente e constrói OrderRow. Clientes ainda não "ativos" na janela são ignorados.
     """
     if not customer_plan:
         return []
 
-    # datas aleatórias (ordenadas para ficar cronológico)
-    dates = [random_order_datetime(rng, start, end_excl) for _ in customer_plan]
-    dates.sort()
-
     status_choices = ("delivered", "cancelled")
     status_weights = (delivered_weight, cancelled_weight)
 
+    pairs: list[tuple[datetime, int]] = []
+    for cid in customer_plan:
+        # limite inferior: quando o cliente "existe"
+        cust_start = max(start, activation_map.get(cid, start))
+        if cust_start >= end_excl:
+            # este cliente só ficou ativo depois da janela — ignora esta ocorrência
+            continue
+
+        dt = random_order_datetime(rng, cust_start, end_excl)
+        pairs.append((dt, cid))
+
+    if not pairs:
+        return []
+
+    # ordenar por data para manter cronologia global
+    pairs.sort(key=lambda t: t[0])
+
     rows: list[OrderRow] = []
-    for cust_id, dt in zip(customer_plan, dates):
+    for dt, cust_id in pairs:
         status_code = rng.choices(status_choices, weights=status_weights, k=1)[0]
         status_id = status_map[status_code]
         rows.append(OrderRow(cust_id, dt, status_id, dt, dt))
@@ -391,7 +421,7 @@ def run(seed: int = SEED) -> None:
     rng = random.Random(seed)
     print(f"🔌 A ligar à BD '{DB_CONFIG['database']}' como '{DB_CONFIG['user']}' em '{DB_CONFIG['host']}'...")
 
-    # Conexão e transação
+    # Coneção e transação
     conn = get_connection()
     conn.autocommit = False
     
@@ -400,24 +430,31 @@ def run(seed: int = SEED) -> None:
             
             cur.execute("SET time_zone = '+00:00';")
             
+            # Fetchers
             customer_ids = fetch_customer_ids(cur)
+            activation_map = fetch_customer_activation(cur)
             status_map = fetch_order_status_ids(cur)
-
-        n_clients = len(customer_ids)
-        hard_max = max_orders_possible(n_clients, list(ORDERS_WEIGHTS.keys()))
+            
+        # Só clientes com activation < ORDERS_END_EXCL
+        eligible_customers = [cid for cid in customer_ids if activation_map.get(cid, ORDERS_START) < ORDERS_END_EXCL]
+        if not eligible_customers:
+            raise RuntimeError("No available customers at the order creation window.")
+        
+        # hard max com base apenas nos elegíveis
+        hard_max = max_orders_possible(len(eligible_customers), list(ORDERS_WEIGHTS.keys()))
         if MIN_TOTAL_ORDERS is not None and MIN_TOTAL_ORDERS > hard_max:
             raise RuntimeError(
-                f"MIN_TOTAL_ORDERS={MIN_TOTAL_ORDERS} é impossível com {n_clients} clientes "
-                f"e máximo {max(ORDERS_WEIGHTS.keys())} encomendas/cliente (máximo teórico = {hard_max})."
+                f"MIN_TOTAL_ORDERS={MIN_TOTAL_ORDERS} is impossible with {len(eligible_customers)} available customers."
+                f"and max {max(ORDERS_WEIGHTS.keys())} orders/customers (theoric max = {hard_max})."
             )
-
-        # plano de encomendas (lista de customer_ids)
-        customer_plan = plan_orders_for_customers(customer_ids, ORDERS_WEIGHTS, rng, MIN_TOTAL_ORDERS)
+        
+        # Plano (lista de customer_ids; 1 por encomenda)
+        customer_plan = plan_orders_for_customers(eligible_customers, ORDERS_WEIGHTS, rng, MIN_TOTAL_ORDERS)
         if not customer_plan:
-            print("⚠️ Quotas resultaram em 0 encomendas — nada a inserir.")
+            print("⚠️ Quotas resulted in 0 orders - nothing to insert.")
             return
 
-        # gerar linhas completas
+        # gerar linhas respeitando activation por cliente
         rows = generate_order_rows(
             customer_plan,
             status_map,
@@ -426,6 +463,7 @@ def run(seed: int = SEED) -> None:
             ORDERS_END_EXCL,
             DELIVERED_WEIGHT,
             CANCELLED_WEIGHT,
+            activation_map=activation_map,
         )
 
         # inserir em batches
@@ -433,9 +471,9 @@ def run(seed: int = SEED) -> None:
         total_inserted, batches = insert_orders_in_batches(conn, rows, BATCH_SIZE)
         elapsed = time.perf_counter() - start_time
 
-        print(f"✅ Inseridas {total_inserted} encomendas em {batches} batch(es).")
+        print(f"✅ Inserted {total_inserted} orders in {batches} batch(es).")
         if elapsed > 0:
-            print(f"⏱️ Tempo de inserção: {elapsed:.2f}s (~{total_inserted/elapsed:.1f} rows/s)")
+            print(f"⏱️ Insertion time: {elapsed:.2f}s (~{total_inserted/elapsed:.1f} rows/s)")
 
         # relatórios
         report_summary(rows, status_map)

@@ -33,7 +33,3 @@ CREATE USER IF NOT EXISTS 'dashboard_app'@'<HOST>'
   IDENTIFIED BY '<STRONG_PASSWORD_DASHBOARD_APP>';
 GRANT readonly TO 'dashboard_app'@'<HOST>';
 SET DEFAULT ROLE readonly TO 'dashboard_app'@'<HOST>';
-
-
-
-

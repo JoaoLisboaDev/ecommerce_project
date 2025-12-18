@@ -93,7 +93,7 @@ MAX_ITEMS_PER_ORDER = 5
 RETURN_MIN_DAYS = 3
 RETURN_MAX_DAYS = 30
 
-ALLOWED_ORDER_STATUS_CODES = ("delivered", "cancelled")
+ALLOWED_ORDER_STATUS_CODES = ("delivered",)
 PAID_STATUS_CODES = ("paid",)
 
 BATCH_SIZE = 20_000
@@ -120,6 +120,7 @@ class CandidateItem:
     category_name: str
     customer_iso: str
     last_paid_at: datetime
+    order_updated_at: datetime
 
 @dataclass(frozen=True)
 class LookupMaps:
@@ -153,22 +154,25 @@ def fetch_lookup_maps(cur: "mysql.connector.cursor.MySQLCursor") -> LookupMaps:
     return LookupMaps(reason_map, category_map, country_map)
 
 def fetch_candidate_items(conn) -> list[CandidateItem]:
-    sql = f"""
+    sql = """
     WITH paid_orders AS (
         SELECT p.order_id, MAX(p.payment_date) AS last_paid_at
         FROM payments p
         JOIN payment_status ps ON ps.payment_status_id = p.payment_status_id
-        WHERE ps.code IN ({",".join(["%s"]*len(PAID_STATUS_CODES))})
+        WHERE ps.code = %s              -- 'paid'
         GROUP BY p.order_id
     ),
     eligible_orders AS (
-        SELECT o.order_id, po.last_paid_at, os.code AS order_status_code, ctry.iso_code AS customer_iso
+        SELECT
+            o.order_id,
+            po.last_paid_at,
+            ctry.iso_code AS customer_iso
         FROM orders o
         JOIN order_status os ON os.order_status_id = o.order_status_id
-        JOIN customers cu ON cu.customer_id = o.customer_id
-        JOIN countries ctry ON ctry.country_id = cu.country_id
-        JOIN paid_orders po ON po.order_id = o.order_id
-        WHERE os.code IN ({",".join(["%s"]*len(ALLOWED_ORDER_STATUS_CODES))})
+        JOIN customers cu    ON cu.customer_id = o.customer_id
+        JOIN countries ctry  ON ctry.country_id = cu.country_id
+        JOIN paid_orders po  ON po.order_id = o.order_id
+        WHERE os.code = %s               -- só 'cancelled'
     )
     SELECT
         oi.order_item_id,
@@ -178,11 +182,13 @@ def fetch_candidate_items(conn) -> list[CandidateItem]:
         oi.unit_price,
         pc.name AS category_name,
         eo.customer_iso,
-        eo.last_paid_at
+        eo.last_paid_at,
+        o2.updated_at AS order_updated_at      -- << buscamos aqui diretamente de orders
     FROM order_items oi
-    JOIN products pr ON pr.product_id = oi.product_id
-    JOIN product_categories pc ON pc.category_id = pr.category_id
-    JOIN eligible_orders eo ON eo.order_id = oi.order_id
+    JOIN products pr            ON pr.product_id = oi.product_id
+    JOIN product_categories pc  ON pc.category_id = pr.category_id
+    JOIN eligible_orders eo     ON eo.order_id = oi.order_id
+    JOIN orders o2              ON o2.order_id = oi.order_id
     ORDER BY oi.order_item_id ASC
     """
     params = list(PAID_STATUS_CODES) + list(ALLOWED_ORDER_STATUS_CODES)
@@ -201,6 +207,7 @@ def fetch_candidate_items(conn) -> list[CandidateItem]:
             category_name=str(r["category_name"]),
             customer_iso=str(r["customer_iso"]),
             last_paid_at=r["last_paid_at"],
+            order_updated_at=r["order_updated_at"],
         )
         for r in rows
     ]
@@ -314,14 +321,12 @@ def build_return_rows(
 ) -> list[tuple[int, datetime, Decimal, int]]:
     rows: list[tuple[int, datetime, Decimal, int]] = []
     for it in items:
-        paid_date: date = it.last_paid_at.date()
+        # data de referência: depois do último pagamento e do cancelamento
+        ref_date = max(it.last_paid_at, it.order_updated_at).date()
         delta_days = rng.randint(RETURN_MIN_DAYS, RETURN_MAX_DAYS)
-        return_dt = datetime.combine(paid_date + timedelta(days=delta_days), dtime(12, 0, 0))
+        return_dt = datetime.combine(ref_date + timedelta(days=delta_days), dtime(12, 0, 0))
 
-        unit_price = it.unit_price
-        qty = int(it.quantity)
-        refund_amount = (unit_price * qty).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-
+        refund_amount = (it.unit_price * int(it.quantity)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         reason_id = choose_reason_for_item(rng, it.category_name, CATEGORY_REASON_DISTS, reason_code_to_id)
         rows.append((it.order_item_id, return_dt, refund_amount, reason_id))
     return rows

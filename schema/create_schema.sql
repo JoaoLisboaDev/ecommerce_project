@@ -1,6 +1,7 @@
 /* ===========================
-   ECOMMERCE DB
-   - Requer MySQL 8.0.16+
+   create_schema.sql
+   
+   - Requires MySQL 8.0.16+
    =========================== */
 
 /* ===========================
@@ -147,6 +148,7 @@ CREATE TABLE order_items (
 CREATE TABLE payments (
 	payment_id INT UNSIGNED AUTO_INCREMENT,
 	order_id INT UNSIGNED NOT NULL,
+    attempt_no INT UNSIGNED NOT NULL,
 	payment_date DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 	amount_paid DECIMAL(12,2) NOT NULL CHECK (amount_paid >= 0),
 	payment_method_id TINYINT UNSIGNED NOT NULL,
@@ -182,7 +184,3 @@ CREATE TABLE product_returns (
 	INDEX idx_product_returns_order_item (order_item_id),
 	INDEX idx_product_returns_reason (return_reason_id)
 ) ENGINE=InnoDB;
-
-
-
-

@@ -77,6 +77,10 @@ COUNTRY_DISTRIBUTION = {
     "Ireland": 10
 }
 
+# Time window for the customer creation date
+CUSTOMERS_START = datetime(2023, 1, 1, 0, 0, 0)
+CUSTOMERS_END_EXCL = datetime(2025, 8, 1, 0, 0, 0)  # exclusive
+
 # Distribuição etária em percentagens.
 AGE_GROUPS = {                                                                
     (18, 29): 40,   # 40% between 18 and 30
@@ -117,8 +121,8 @@ FAKER_LOCALE_BY_COUNTRY = {
 }
 
 SQL_INSERT = """
-INSERT INTO customers (first_name, last_name, birth_date, city, country_id, created_at)
-VALUES (%s, %s, %s, %s, %s, %s)
+INSERT INTO customers (first_name, last_name, birth_date, city, country_id, created_at, updated_at)
+VALUES (%s, %s, %s, %s, %s, %s, %s)
 """
 
 # --------------------------------------------------------------------------------------------------------------------------------------
@@ -209,40 +213,72 @@ def random_birthdate(age_min: int, age_max: int) -> date:
     return min_birth + timedelta(days=random.randrange(span + 1))                                       
 
 
-def random_created_at(start_year=2023, end_year=2025, end_month=8) -> datetime:
-    """
-    Gera uma data/hora aleatória entre o início de `start_year` e o fim de `end_month` em `end_year`.
 
-    Args:
-        start_year: Ano inicial do intervalo (default: 2023).
-        end_year: Ano final do intervalo (default: 2025).
-        end_month: Mês final dentro do ano final (default: 8 → agosto).
-
-    Returns:
-        Um objeto `datetime` aleatório dentro do intervalo definido.
+def random_signup_datetime(rng: random.Random, start: datetime, end_excl: datetime) -> datetime:
     """
-    
-    # Início do intervalo
-    # EXP: start = datetime(2023, 1, 1) = 2023-01-01 00:00:00
-    start = datetime(start_year, 1, 1)                                                                  
-    
-    # Último dia do mês final
-    # EXP: calendar.monthrange(2025, 8) = (calendar.FRIDAY, 31)
-    # EXP: last_day = (calendar.FRIDAY, 31)[1] = 31
-    last_day = calendar.monthrange(end_year, end_month)[1] 
-    
-    # Data final do intervalo
-    # EXP: end = datetime(2025, 8, 31, 23, 59, 59) = 2025-08-31 23:59:59                                         
-    end = datetime(end_year, end_month, last_day, 23, 59, 59)
-    
-    # Total de segundos no intervalo                                       
-    delta = int((end - start).total_seconds())
-    
-    # Escolhe um offset aleatório em segundos                                                    
-    offset = random.randrange(delta + 1)
-    
-    # Retorna a data inicial + offset aleatório                                                          
-    return start + timedelta(seconds=offset) 
+    Generates a "realistic" datetime for customer registration with monthly seasonality and a weekend boost.
+    """
+    if start >= end_excl:
+        raise ValueError("`start` must be earlier than `end_excl`.")
+
+    # 1) Define the weights by month
+    month_weight = {
+        1:0.85, 2:0.90, 3:1.00, 4:1.05, 5:1.10,
+        6:0.95, 7:0.80, 8:0.85, 9:1.10, 10:1.20,
+        11:1.30, 12:1.50
+    }
+
+    # 2) Chose a day on the interval with weights on months and weekend boost.
+    days: list[tuple[datetime, float]] = []
+    d = start.date()
+    last = (end_excl - timedelta(seconds=1)).date()
+    while d <= last:
+        w = month_weight.get(d.month, 1.0)
+        if d.weekday() >= 5:  # Sáb/Dom
+            w *= 1.2
+        days.append((datetime(d.year, d.month, d.day), w))
+        d += timedelta(days=1)
+
+    total_w = sum(w for _, w in days)
+    pick_day = rng.choices([dt for dt, _ in days], weights=[w/total_w for _, w in days], k=1)[0]
+
+    # 3) hora do dia (picos às 10–13h e 18–22h)
+    hour_weights = [1.0]*24
+    for h in range(10, 14): hour_weights[h] = 1.8
+    for h in range(18, 23): hour_weights[h] = 2.0
+    hour = rng.choices(range(24), weights=hour_weights, k=1)[0]
+    minute = rng.randint(0, 59)
+    second = rng.randint(0, 59)
+    return pick_day.replace(hour=hour, minute=minute, second=second)
+
+def build_created_at_schedule(
+    n: int,
+    start: datetime,
+    end_excl: datetime,
+    rng: random.Random,
+) -> list[datetime]:
+    """
+    Gera N datetimes realistas no intervalo, ordena e força monotonia estrita (sem empates).
+    """
+    if n <= 0:
+        return []
+
+    pool = [random_signup_datetime(rng, start, end_excl) for _ in range(n)]
+    pool.sort()  # ordem cronológica
+
+    # garantir strictly increasing: se igual ou a recuar (improvável), empurra +1..5s
+    for i in range(1, n):
+        if pool[i] <= pool[i-1]:
+            bump = rng.randint(1, 5)
+            pool[i] = pool[i-1] + timedelta(seconds=bump)
+
+        # cap no end_excl-1s (só para segurança)
+        if pool[i] >= end_excl:
+            pool[i] = end_excl - timedelta(seconds=1)
+
+    return pool
+
+
 
 # --------------------------------------------------------------------------------------------------------------------------------------
 # VALIDATIONS & SETUP
@@ -376,7 +412,7 @@ def generate_customer(
         birth_date=birth,
         city=random.choice(cities_by_country[cname]),
         country_id=name_to_id[cname],
-        created_at=random_created_at(),
+        created_at=datetime.min,   # placeholder: will be substituted on row_stream 
     )
     return cname, row
 
@@ -425,7 +461,15 @@ def insert_batch(cur, rows: list[CustomerRow]) -> int:
     
     # Constrói tuplos na ordem exata das colunas do SQL_INSERT
     payload = [
-        (r.first_name, r.last_name, r.birth_date, r.city, r.country_id, r.created_at)
+        (
+            r.first_name, 
+            r.last_name, 
+            r.birth_date, 
+            r.city, 
+            r.country_id, 
+            r.created_at,
+            r.created_at,  # updated_at = created_at
+         )
         for r in rows
     ]
     
@@ -468,15 +512,29 @@ def run(n_customers: int, batch_size: int, seed: int) -> None:
             if missing:
                 raise ValueError(f"Country(ies) missing in table 'countries': {missing}")
 
-            # 3.2) gerador de linhas
+            # 3.2) precomputar created_at sequencial (IDs baixos mais cedo)
+            rng = random.Random(seed)
+            created_schedule = build_created_at_schedule(
+                n_customers, CUSTOMERS_START, CUSTOMERS_END_EXCL, rng
+            )
+
+            # 3.3) gerador de linhas que consome o schedule
             def row_stream() -> Iterator[CustomerRow]:
-                for _ in range(n_customers):
+                for i in range(n_customers):
                     cname, row = generate_customer(
                         country_names, country_weights, age_ranges, age_weights,
                         CITIES_BY_COUNTRY, fakers, name_to_id
                     )
                     counts_by_country[cname] += 1
-                    yield row
+                    # substitui o created_at aleatório pelo sequencial
+                    yield CustomerRow(
+                        first_name=row.first_name,
+                        last_name=row.last_name,
+                        birth_date=row.birth_date,
+                        city=row.city,
+                        country_id=row.country_id,
+                        created_at=created_schedule[i],
+                    )
 
             # 3.3) inserir em batches
             for batch in batched(row_stream(), batch_size or n_customers):

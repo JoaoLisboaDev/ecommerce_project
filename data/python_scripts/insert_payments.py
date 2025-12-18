@@ -376,7 +376,37 @@ def run(seed: int = SEED) -> None:
                                 status_id_by_code["failed"],
                             )
                         )
+                
+                if not paid:
+                    if order.order_status != 5:
+                        # Força sucesso final para encomendas não-canceladas
+                        t_force = (
+                            (attempt_times[-1] + timedelta(seconds=1))
+                            if attempt_times else (order.order_date + timedelta(seconds=1))
+                        )
 
+                        # Escolhe um método válido (tenta o corrente; se não houver, usa o primeiro da tabela)
+                        method_id = method_id_by_code.get(current_method)
+                        if method_id is None:
+                            method_id = next(iter(method_id_by_code.values()))
+
+                        attempt_no += 1
+                        rows.append(
+                            (
+                                order.order_id,
+                                attempt_no,
+                                t_force,
+                                order.order_total,
+                                method_id,
+                                status_id_by_code["paid"],
+                            )
+                        )
+                    else:
+                        # order_status == 5 (cancelada): é aceitável terminar com falha
+                        pass
+            
+            
+            
             start = time.perf_counter()
             total, batches = insert_payments_in_batches(conn, rows, BATCH_SIZE)
             elapsed = time.perf_counter() - start
