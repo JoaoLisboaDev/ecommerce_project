@@ -48,13 +48,10 @@ SELECT
     co.iso_code AS country,
 	cu.first_name,
 	cu.last_name,
+	cu.email,
 	cu.birth_date,
 	cu.city,
-	cu.country_id,
-    
-    -- Orders by customer
     COALESCE(obc.total_orders, 0) orders_count,
-    
 	cu.created_at,
 	cu.updated_at
 FROM customers cu

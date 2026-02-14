@@ -10,7 +10,9 @@ import mysql.connector
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta                            
 import calendar                                                               
-import time                                                                   
+import time
+import re
+import unicodedata                                                                
 from dotenv import load_dotenv                                               
 load_dotenv()   
 
@@ -105,6 +107,13 @@ CITIES_BY_COUNTRY = {
     "Croatia": ["Zagreb", "Split", "Rijeka", "Osijek", "Zadar","Pula", "Dubrovnik", "Slavonski Brod", "Karlovac", "Varazdin"],
 }
 
+EMAIL_DOMAIN_DISTRIBUTION = {
+    'gmail.com': 40,
+    'yahoo.com': 30,
+    'hotmail.com': 22,
+    'outlook.com': 8
+}
+
 # Locale usado pelo Faker para gerar nomes realistas por país.
 # A Bélgica tem duas línguas principais (fr/nl). Por simplicidade foi escolhido fr_BE.
 FAKER_LOCALE_BY_COUNTRY = {                                                                             
@@ -121,8 +130,8 @@ FAKER_LOCALE_BY_COUNTRY = {
 }
 
 SQL_INSERT = """
-INSERT INTO customers (first_name, last_name, birth_date, city, country_id, created_at, updated_at)
-VALUES (%s, %s, %s, %s, %s, %s, %s)
+INSERT INTO customers (first_name, last_name, email, birth_date, city, country_id, created_at, updated_at)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
 """
 
 # --------------------------------------------------------------------------------------------------------------------------------------
@@ -278,7 +287,88 @@ def build_created_at_schedule(
 
     return pool
 
+# Função para normalizar nomes em emails
+def normalize_email_names(text: str) -> str:
+    
+    # Remove espaços e transforma todas as letras em minúsculas
+    s = text.strip().lower()
+    
+    s = unicodedata.normalize('NFKD', s)
+    
+    s = ''.join(ch for ch in s if not unicodedata.combining(ch))
+    
+    # remove caracteres não-ascii (ex.: grego)
+    s = s.encode("ascii", "ignore").decode("ascii")
+    
+    # mantém só [a-z0-9]
+    s = re.sub(r"[^a-z0-9]+", "", s)
+    
+    return s
 
+def make_unique_email(
+    first_name: str,
+    last_name: str,
+    domain: str,
+    *,
+    rng: random.Random,
+    used_locals: set[str],
+    used_emails: set[str],
+) -> str:
+    fn = normalize_email_names(first_name)
+    ln = normalize_email_names(last_name)
+    base_local = f"{fn}.{ln}"
+    domain = domain.lower().strip()
+
+    base_email = f"{base_local}@{domain}"
+
+    # regra: se já existir um email com o mesmo conjunto de nomes, adicionar dígito 0–9
+    needs_suffix = (base_local in used_locals) or (base_email in used_emails)
+    used_locals.add(base_local)
+
+    if not needs_suffix:
+        used_emails.add(base_email)
+        return base_email
+
+    # tenta com 1 dígito (0–9)
+    for _ in range(25):
+        digit = rng.randint(0, 9)
+        email = f"{fn}.{ln}{digit}@{domain}"
+        if email not in used_emails:
+            used_emails.add(email)
+            return email
+
+    # fallback (se houver MUITAS colisões): garante unicidade
+    while True:
+        suffix = rng.randint(0, 9999)
+        email = f"{fn}.{ln}{suffix}@{domain}"
+        if email not in used_emails:
+            used_emails.add(email)
+            return email
+
+def build_domain_schedule(n: int, dist: Mapping[str, int], rng: random.Random) -> list[str]:
+    """
+    Gera uma lista de domínios com contagens inteiras (o mais próximo possível da percentagem),
+    e baralha para distribuir ao longo do dataset.
+    """
+    weights = normalize_distribution(dist)
+    expected = {k: weights[k] * n for k in weights}
+    counts = {k: int(expected[k]) for k in weights}
+    remainder = n - sum(counts.values())
+
+    order = sorted(weights.keys(), key=lambda k: expected[k] - counts[k], reverse=True)
+    for i in range(remainder):
+        counts[order[i % len(order)]] += 1
+
+    schedule = [dom for dom, cnt in counts.items() for _ in range(cnt)]
+    rng.shuffle(schedule)
+    return schedule
+
+def fetch_existing_emails(cur) -> set[str]:
+    """
+    Lê emails já existentes na tabela customers (para não colidir quando corres o script mais do que uma vez).
+    """
+    cur.execute("SELECT email FROM customers")
+    return {e.lower() for (e,) in cur.fetchall() if e}
 
 # --------------------------------------------------------------------------------------------------------------------------------------
 # VALIDATIONS & SETUP
@@ -366,6 +456,7 @@ def fetch_country_name_to_id(cur) -> dict[str, int]:
 class CustomerRow:
     first_name: str
     last_name: str
+    email: str
     birth_date: date
     city: str
     country_id: int
@@ -380,6 +471,11 @@ def generate_customer(
     cities_by_country: dict[str, list[str]],
     fakers: dict[str, Faker],
     name_to_id: dict[str, int],
+    *,
+    email_domain: str,
+    email_rng: random.Random,
+    used_locals: set[str],
+    used_emails: set[str],
 ) -> tuple[str, CustomerRow]:
     """
     Gera um cliente aleatório com base nas distribuições configuradas.
@@ -405,14 +501,26 @@ def generate_customer(
     birth = random_birthdate(amin, amax)
     fk = fakers[cname]
     
+    first = fk.first_name()
+    last = fk.last_name()
+    
+    # Email
+    email = make_unique_email(
+        first, last, email_domain,
+        rng=email_rng,
+        used_locals=used_locals,
+        used_emails=used_emails,
+    )
+    
     # Constrói o objeto CustomerRow
     row = CustomerRow(
-        first_name=fk.first_name(),
-        last_name=fk.last_name(),
+        first_name=first,
+        last_name=last,
+        email=email,
         birth_date=birth,
         city=random.choice(cities_by_country[cname]),
         country_id=name_to_id[cname],
-        created_at=datetime.min,   # placeholder: will be substituted on row_stream 
+        created_at=datetime.min,  # placeholder
     )
     return cname, row
 
@@ -464,6 +572,7 @@ def insert_batch(cur, rows: list[CustomerRow]) -> int:
         (
             r.first_name, 
             r.last_name, 
+            r.email,
             r.birth_date, 
             r.city, 
             r.country_id, 
@@ -518,23 +627,48 @@ def run(n_customers: int, batch_size: int, seed: int) -> None:
                 n_customers, CUSTOMERS_START, CUSTOMERS_END_EXCL, rng
             )
 
+            # emails já existentes (para não colidir em re-execuções)
+            existing_emails = fetch_existing_emails(cur)
+            used_emails: set[str] = set(existing_emails)
+
+            # usados por "conjunto de nomes" (local-part base). Para emails existentes,
+            # consideramos o local sem 1 dígito final (se houver) como "base".
+            used_locals: set[str] = set()
+            for e in existing_emails:
+                local = e.split("@", 1)[0]
+                base = local[:-1] if local and local[-1].isdigit() else local
+                used_locals.add(base)
+
+            # schedule de domínios com a distribuição pedida
+            domain_rng = random.Random(seed + 999)
+            domain_schedule = build_domain_schedule(n_customers, EMAIL_DOMAIN_DISTRIBUTION, domain_rng)
+
+            # rng separado para os dígitos de colisão (reprodutível)
+            email_rng = random.Random(seed + 555)
+            
             # 3.3) gerador de linhas que consome o schedule
             def row_stream() -> Iterator[CustomerRow]:
                 for i in range(n_customers):
                     cname, row = generate_customer(
                         country_names, country_weights, age_ranges, age_weights,
-                        CITIES_BY_COUNTRY, fakers, name_to_id
+                        CITIES_BY_COUNTRY, fakers, name_to_id,
+                        email_domain=domain_schedule[i],
+                        email_rng=email_rng,
+                        used_locals=used_locals,
+                        used_emails=used_emails
                     )
                     counts_by_country[cname] += 1
+                    
                     # substitui o created_at aleatório pelo sequencial
                     yield CustomerRow(
                         first_name=row.first_name,
                         last_name=row.last_name,
+                        email=row.email,
                         birth_date=row.birth_date,
                         city=row.city,
                         country_id=row.country_id,
                         created_at=created_schedule[i],
-                    )
+        )
 
             # 3.3) inserir em batches
             for batch in batched(row_stream(), batch_size or n_customers):

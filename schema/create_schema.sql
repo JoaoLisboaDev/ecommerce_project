@@ -69,9 +69,9 @@ CREATE TABLE return_reasons (
   CONSTRAINT uq_return_reasons_code UNIQUE (code)
 ) ENGINE=InnoDB;
 
-/* ===========================
-   PRODUCTS
-   =========================== */
+-- ===========================
+-- > PRODUCTS
+-- ===========================
 
 CREATE TABLE products(
 	product_id INT UNSIGNED AUTO_INCREMENT,
@@ -95,6 +95,7 @@ CREATE TABLE customers (
 	customer_id INT UNSIGNED AUTO_INCREMENT,
 	first_name VARCHAR(100) NOT NULL,
 	last_name VARCHAR(100) NOT NULL,
+	email VARCHAR(100) NOT NULL,
     birth_date DATE,
     city VARCHAR(100),
 	country_id SMALLINT UNSIGNED NOT NULL,
@@ -184,3 +185,66 @@ CREATE TABLE product_returns (
 	INDEX idx_product_returns_order_item (order_item_id),
 	INDEX idx_product_returns_reason (return_reason_id)
 ) ENGINE=InnoDB;
+
+-- ============================================================================================
+-- > Employees
+-- ============================================================================================
+
+CREATE TABLE employees (
+	employee_id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    department VARCHAR(100) NOT NULL,
+    salary INT UNSIGNED NOT NULL
+) ENGINE=InnoDB;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

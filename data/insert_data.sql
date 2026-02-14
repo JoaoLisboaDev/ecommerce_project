@@ -47,3 +47,15 @@ INSERT INTO return_reasons (code, name) VALUES
 	('late','Late delivery'),
 	('change_of_mind','Change of mind'),
 	('other','Other reason');
+    
+    
+INSERT INTO employees (department, salary) VALUES
+	('IT', 80000),
+    ('IT', 75000),
+    ('Operations', 50000),
+    ('Finance', 55000),
+    ('Marketing', 60000),
+    ('IT', 75000),
+    ('Finance', 55000),
+    ('IT', 90000),
+    ('IT', 60000);
